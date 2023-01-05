@@ -11,6 +11,8 @@ import json
 
 import tqdm
 
+from rl4lms import conv_bfloat16
+
 
 def batcher(iterator, batch_size=4, progress=False):
     if progress:
@@ -337,7 +339,7 @@ class SummaCConv(torch.nn.Module):
                     [0.0, 0.0, 0.0]).unsqueeze(0))  # .cuda()
         features = torch.cat(features)
         logits = self.layer_final(features)
-        histograms_out = [histogram.cpu().numpy() for histogram in histograms]
+        histograms_out = [conv_bfloat16(histogram.cpu()).numpy() for histogram in histograms]
         return logits, histograms_out, images
 
     def save_imager_cache(self):

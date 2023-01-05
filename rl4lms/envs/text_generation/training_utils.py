@@ -1,6 +1,9 @@
 from functools import partial
+import logging
 from typing import Any, Dict, List
 import numpy as np
+import rich
+
 
 from rl4lms.data_pools.text_generation_pool import Sample
 from rl4lms.envs.text_generation.env import TextGenEnv
@@ -15,7 +18,7 @@ from rl4lms.envs.text_generation.registry import (DataPoolRegistry,
                                                    WrapperRegistry)
 from rl4lms.envs.text_generation.reward import RewardFunction
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv as SubprocVecEnv # jules julesgm changed this
 from transformers import (AutoTokenizer,
                           AutoModelForCausalLM,
                           AutoModelForSeq2SeqLM,
@@ -29,6 +32,10 @@ from rl4lms.envs.text_generation.utils_supervised import (get_datasets_for_causa
                                                            tokenize_seq2seq,
                                                            EvalCallack)
 from rl4lms.envs.text_generation.warm_start import TrainerWarmStartMixin
+
+
+LOGGER = logging.getLogger(__name__)
+CONSOLE = rich.console.Console(width=80)
 
 
 def build_tokenizer(tokenizer_config: Dict[str, Any]):
@@ -192,15 +199,26 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
                                 gen_kwargs=self._eval_gen_kwargs)
 
     def train_and_eval(self):
+        CONSOLE.print(f"[bold blue]train_and_eval: [bold white]Entry.")
+
         # evaluate on val and test set before fine-tuning once
         iter_start = self._trainer_state["current_iter"]
+
+        CONSOLE.print(f"[bold blue]train_and_eval: [bold white]Eval at the very beginning of training")
         self._evaluate_on_datapools(epoch=iter_start)
 
         # train for given number of iters
         for epoch in range(iter_start, self._n_iters):
+            # <Jules:>
+            CONSOLE.print(f"[bold blue]train_and_eval:[bold white] Starting epoch: {epoch + 1} / {self._n_iters}")
+            # </Jules>
+
             # current state
             self._trainer_state["current_iter"] = epoch
 
+            # <Jules:>
+            CONSOLE.print(f"[bold blue]train_and_eval:[bold white] self._alg.learn")
+            # </Jules>
             # inner rollout and learn loop for on-policy algorithm
             self._alg.learn(self._n_steps_per_iter)
 
@@ -210,16 +228,24 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
                     self._tracker, self._alg.policy, self._trainer_state)
 
             # evaluate on val set in the given intervals
+            # <Jules:>
+            CONSOLE.print(f"[bold blue]train_and_eval:[bold white] self._evaluate_on_datapools")
+            # </Jules>
             if (epoch + 1) % self._train_eval_config["eval_every"] == 0:
                 self._evaluate_on_datapools(epoch=epoch, splits=["val"])
 
         # finally evaluate on val and test samples
+        CONSOLE.print(f"[bold blue]train_and_eval: [bold white]Eval at the very end of training")
+
         self._evaluate_on_datapools(epoch=epoch)
 
         # save model here - we save only the language model
         if self._tracker is not None:
+            CONSOLE.print(f"[bold blue]train_and_eval: [bold white]self._tracker.save_auto_model")
             self._tracker.save_auto_model(
                 self._alg.policy.get_language_model())
+
+            CONSOLE.print(f"[bold blue]train_and_eval: [bold white]Done.")
 
 
 class SupervisedTrainer:

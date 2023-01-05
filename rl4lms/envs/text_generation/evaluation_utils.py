@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Dict, List
 
 from stable_baselines3.common.policies import BasePolicy
@@ -7,6 +8,8 @@ from transformers import AutoTokenizer
 from rl4lms.data_pools.custom_text_generation_pools import Sample
 from rl4lms.envs.text_generation.logging_utils import Tracker
 from rl4lms.envs.text_generation.metric import BaseMetric
+
+LOGGER = logging.getLogger(__name__)
 
 
 def get_batch(samples: List[Sample], batch_size: int):
@@ -37,7 +40,7 @@ def evaluate_on_samples(
     all_prompt_texts = []
     all_meta_infos = []
     n_samples = len(samples)
-    for batch in tqdm(list(get_batch(samples, batch_size)), desc="Evaluating"):
+    for batch in tqdm(list(get_batch(samples, batch_size)), desc="Evaluation - collecting rollouts."):
         batch_generated_texts = generate_text(
             policy, tokenizer, batch, max_prompt_length, dt_control_token, gen_kwargs
         )
@@ -62,6 +65,12 @@ def evaluate_on_samples(
                 policy.get_language_model(),
                 split_name,
             )
+
+            if "em_accuracy" in metric_dict:
+                LOGGER.info(
+                    f"[bold blue]Metric {metric}: "
+                    f"[bold white]em_accuracy: {metric_dict['em_accuracy'][1]}"
+                )
 
             for metric_key, (sample_scores, corpus_score) in metric_dict.items():
                 if sample_scores is None:

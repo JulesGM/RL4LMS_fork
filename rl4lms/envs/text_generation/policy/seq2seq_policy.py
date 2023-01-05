@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Dict, Optional, List, Union
 import torch
 from gym.spaces import Discrete
@@ -30,6 +31,8 @@ from rl4lms.envs.text_generation.policy.base_policy import (
     EvaluateActionsOutput,
     GenerationOutputs,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 class Seq2SeqLMActorCriticPolicy(LMActorCriticPolicy, ActorCriticWarmStartMixin):
@@ -64,13 +67,19 @@ class Seq2SeqLMActorCriticPolicy(LMActorCriticPolicy, ActorCriticWarmStartMixin)
         self.load_from_dict(state_dict)
 
     def _build_model_heads(self, model_name: str):
+        LOGGER.info(f"[bold blue]_build_model_heads: [white bold]Entry")
+
+        LOGGER.info(f"[bold blue]_build_model_heads: [white bold]Loading policy model")
         self._policy_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
         self._policy_model.__class__ = override_generation_routines(
             type(self._policy_model)
         )
 
+        LOGGER.info(f"[bold blue]_build_model_heads: [white bold]Loading value model")
         self._value_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        LOGGER.info(f"[bold blue]_build_model_heads: [white bold]Copying policy model to ref model")
         self._ref_model = deepcopy(self._policy_model).eval()
+        LOGGER.info(f"[bold blue]_build_model_heads: [white bold]Done copying policy model to ref model")
 
         self._value_head = nn.Linear(
             self._value_model.config.hidden_size, 1, bias=False
@@ -79,17 +88,29 @@ class Seq2SeqLMActorCriticPolicy(LMActorCriticPolicy, ActorCriticWarmStartMixin)
         # apply model parallel
         if torch.cuda.is_available():
             if self._apply_model_parallel and self._policy_model.is_parallelizable:
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]Applying model parallel")
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]self._policy_model.parallelize()")
                 self._policy_model.parallelize()
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]self._ref_model.parallelize()")
                 self._ref_model.parallelize()
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]self._value_model.parallelize()")
                 self._value_model.parallelize()
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]self._value_head.to(self.device)")
                 self._value_head = self._value_head.to(self.device)
             else:  # else defaults to data parallel
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]Building torch.nn.DataParallel")
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]torch.nn.DataParallel(self._policy_model)")
                 self._policy_model = torch.nn.DataParallel(self._policy_model)
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]torch.nn.DataParallel(self._ref_model)")
                 self._ref_model = torch.nn.DataParallel(self._ref_model)
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]torch.nn.DataParallel(self._value_model)")
                 self._value_model = torch.nn.DataParallel(self._value_model)
+                LOGGER.info(f"[bold blue]_build_model_heads: [white bold]torch.nn.DataParallel(self._value_head.to(self.device))")
                 self._value_head = torch.nn.DataParallel(
                     self._value_head.to(self.device)
                 )
+        LOGGER.info(f"[bold blue]_build_model_heads: [white bold]Done.")
+
 
     def forward_policy(
         self,

@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import logging
+
 from typing import Any, Dict, List, Tuple, Type
 
 import numpy as np
@@ -9,6 +11,7 @@ from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.utils import obs_as_tensor
 from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.vec_env import VecEnv
+from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from rl4lms.algorithms.common.maskable.buffers import MaskableDictRolloutBuffer
@@ -21,6 +24,9 @@ from rl4lms.envs.text_generation.policy.base_policy import (
 )
 from rl4lms.envs.text_generation.reward import BatchedRewardFunction, RewardFunction
 from rl4lms.envs.text_generation.warm_start import OnPolicyWarmStartMixin
+from rl4lms import conv_bfloat16
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,7 +83,7 @@ def compute_batched_rewards(
 
     # compute rewards all at once
     rewards = reward_fn(prompts, generated_texts, reference_texts, is_dones, meta_infos)
-    # rewards = rewards.numpy().flatten()
+    # rewards = conv_bfloat16(rewards.numpy()).flatten()
 
     # override the rewards in transitions
     for (env_ix, trans_ix), reward in zip(indices, rewards):
@@ -145,6 +151,8 @@ def wrap_onpolicy_alg(
             max_steps: int,
             rollout_info: Dict[str, Any],
         ):
+
+            LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] start")
             # if rollout buffer is already full, do not continue
             if rollout_buffer.full:
                 return
@@ -156,11 +164,14 @@ def wrap_onpolicy_alg(
             # generate text using the model
             obs_tensor = obs_as_tensor(current_obs, self.device)
             generation_inputs = self.policy.get_inputs_for_generation(obs_tensor)
+
+            LOGGER.debug(f"[bold blue]OnPolicyAlgText.generate_batch:[bold white] POLICY.GENERATE. {generation_inputs.inputs.shape = } {generation_inputs.attention_masks.shape = }")
             gen_output = self.policy.generate(
                 input_ids=generation_inputs.inputs,
                 attention_mask=generation_inputs.attention_masks,
                 tokenizer=tokenizer,
             )
+            LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] DONE WITH POLICY.GENERATE")
 
             # process them one step at a time to collect rollout info
             episode_wise_transitions = [[] for _ in range(self.env.num_envs)]
@@ -174,9 +185,11 @@ def wrap_onpolicy_alg(
                 else [None] * len(gen_output.step_wise_logprobs)
             )
 
-            for actions_tensor, _, action_mask in zip(
+
+            LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] Starting the post generate loop")
+            for actions_tensor, _, action_mask in tqdm(zip(
                 gen_output.step_wise_actions, gen_output.step_wise_logprobs, masks
-            ):
+            ), desc=">>>>> Post generate loop", total=len(gen_output.step_wise_logprobs)):
                 # if all episodes are done, just break and do not continue
                 if np.all(ep_terminated):
                     break
@@ -190,9 +203,12 @@ def wrap_onpolicy_alg(
                         obs_tensor, actions_tensor, policy_past_state, action_mask
                     )
 
+                    LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] post gen loop: forward policy")
                     policy_outputs: PolicyOutput = self.policy.forward_policy(
                         **policy_kwargs
                     )
+                    LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] post gen loop: forward policy DONE")
+
                     raw_log_probs, log_probs, policy_past_state = (
                         policy_outputs.raw_log_probs,
                         policy_outputs.log_probs,
@@ -210,20 +226,25 @@ def wrap_onpolicy_alg(
                     ), "Infinite values in log probs"
 
                     # get values
+                    LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] post gen loop: forward value")
                     value_outputs: ValueOutput = self.policy.forward_value(
                         obs_tensor, value_past_state
                     )
+                    LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] post gen loop: forward value DONE")
+
                     values, value_past_state = (
                         value_outputs.values,
                         value_outputs.past_model_kwargs,
                     )
 
                     # get reference log probs
+                    LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] post gen loop: GET LOG PROBS REF MODEL")
                     ref_policy_outputs: RefPolicyOutput = (
                         self.policy.get_log_probs_ref_model(
                             obs_tensor, actions_tensor, ref_past_state
                         )
                     )
+                    LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] post gen loop: DONE: GET LOG PROBS REF MODEL")
                     ref_log_probs, ref_past_state = (
                         ref_policy_outputs.log_probs,
                         ref_policy_outputs.past_model_kwargs,
@@ -238,20 +259,26 @@ def wrap_onpolicy_alg(
                     kl_div = raw_log_probs - ref_log_probs
                     kl_rewards = -1 * self._kl_controller.kl_coeff * kl_div
 
+                LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] post gen loop - Done")
                 # step into env to get rewards
-                actions = actions_tensor.cpu().numpy()
+                actions = conv_bfloat16(actions_tensor.cpu()).numpy()
+
+                LOGGER.debug(f"[bold blue]OnPolicyAlgText.generate_batch:[bold white] ENV STEP {actions.shape = }")
                 new_obs, rewards, dones, infos = self.env.step(actions)
+                LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] ENV STEP DONE")
 
                 self.num_timesteps += self.env.num_envs
 
                 # compute total rewards
-                total_rewards = rewards + kl_rewards.cpu().numpy()
+                total_rewards = rewards + conv_bfloat16(kl_rewards.cpu()).numpy()
 
                 # unpack individual observations
                 unpacked_obs = unpack_observations(obs_tensor, self.env.num_envs)
 
+                LOGGER.debug("[bold blue]OnPolicyAlgText.generate_batch:[bold white] store episode wise transitions separately")
                 # store episode wise transitions separately
                 for env_ix in range(self.env.num_envs):
+                    LOGGER.debug(f"[bold blue]OnPolicyAlgText.generate_batch:[bold white] store episode wise transitions separately {env_ix} / {self.env.num_envs}")
                     # only if not terminated already
                     if not ep_terminated[env_ix]:
                         transtion = TransitionInfo(
@@ -259,14 +286,14 @@ def wrap_onpolicy_alg(
                             action=actions[env_ix],
                             task_reward=rewards[env_ix],
                             total_reward=total_rewards[env_ix],
-                            kl_div=kl_div.cpu().numpy()[env_ix],
+                            kl_div=conv_bfloat16(kl_div.cpu()).numpy()[env_ix],
                             episode_start=episode_starts[env_ix],
                             value=values[env_ix].cpu(),
                             log_prob=log_probs[env_ix].cpu(),
                             done=dones[env_ix],
                             ref_log_prob=ref_log_probs[env_ix].cpu(),
-                            kl_reward=kl_rewards.cpu().numpy()[env_ix],
-                            action_mask=action_mask[env_ix].cpu().numpy()
+                            kl_reward=conv_bfloat16(kl_rewards.cpu()).numpy()[env_ix],
+                            action_mask=conv_bfloat16(action_mask[env_ix].cpu()).numpy()
                             if action_mask is not None
                             else None,
                             info=infos[env_ix],
@@ -282,9 +309,11 @@ def wrap_onpolicy_alg(
                 current_obs = new_obs
 
             # now we flush all episode wise info to the 1-D buffer
+            LOGGER.debug(f"[bold blue]OnPolicyAlgText.generate_batch:[bold white] self.add_to_buffer {len(episode_wise_transitions) = }")
             rollout_info = self._add_to_buffer(
                 rollout_buffer, episode_wise_transitions, rollout_info
             )
+            LOGGER.debug(f"[bold blue]OnPolicyAlgText.generate_batch:[bold white] self.add_to_buffer Done")
             return rollout_info
 
         def _add_to_buffer(
@@ -307,7 +336,7 @@ def wrap_onpolicy_alg(
                     rollout_info["rollout_info/ref_log_prob"].append(
                         transition.ref_log_prob
                     )
-                    rollout_info["rollout_info/values"].append(transition.value.numpy())
+                    rollout_info["rollout_info/values"].append(conv_bfloat16(transition.value).numpy())
 
                     if not rollout_buffer.full:
                         rollout_buffer.add(
@@ -356,6 +385,7 @@ def wrap_onpolicy_alg(
             rollout_buffer: RolloutBuffer,
             n_rollout_steps: int,
         ) -> bool:
+            LOGGER.debug("[blue bold]OnPolicyAlgText.collect_rollouts:[white bold] Entering collect_rollouts")
             # max episode steps
             max_steps = env.unwrapped.get_attr("max_steps", [0])[0]
 
@@ -367,6 +397,7 @@ def wrap_onpolicy_alg(
             self.policy.set_training_mode(False)
 
             # reset rollout buffer and stats
+            LOGGER.debug("[blue bold]OnPolicyAlgText.collect_rollouts:[white bold] Reset rollout buffer")
             rollout_buffer.reset()
 
             # start the rollout process
@@ -379,28 +410,40 @@ def wrap_onpolicy_alg(
                 "rollout_info/ref_log_prob": [],
                 "rollout_info/values": [],
             }
+
             while not rollout_buffer.full:
                 # generate batch of rollouts
+                LOGGER.debug("[blue bold]OnPolicyAlgText.collect_rollouts:[white bold] generate_batch")
                 rollout_info = self.generate_batch(
                     rollout_buffer, tokenizer, max_steps, rollout_info
                 )
+            
+            LOGGER.debug("[blue bold]OnPolicyAlgText.collect_rollouts:[white bold] Got Out of Generate_batch")
 
             # aggregate rollout info
             aggregated_rollout_info = {}
             for key, values in rollout_info.items():
-                aggregated_rollout_info[key] = np.mean(values).item()
-                aggregated_rollout_info[f"{key}_std"] = np.std(values).item()
+                
+                aggregated_rollout_info[key] = np.mean(conv_bfloat16(values)).item()
+                aggregated_rollout_info[f"{key}_std"] = np.std(conv_bfloat16(values)).item()
             aggregated_rollout_info[
                 "rollout_info/kl_coeff"
             ] = self._kl_controller.kl_coeff
 
+            LOGGER.debug(f"[blue bold]OnPolicyAlgText.collect_rollouts:[white bold] Logging rollouts to tracker")
+
             if self.tracker is not None:
                 self.tracker.log_rollout_infos(aggregated_rollout_info)
+
+            LOGGER.debug(f"[blue bold]OnPolicyAlgText.collect_rollouts:[white bold] Stepping KL Controller")
 
             # adapt the KL coeff
             self._kl_controller.step(
                 torch.tensor(aggregated_rollout_info["rollout_info/kl_div_mean"])
             )
+
+            LOGGER.debug(f"[blue bold]OnPolicyAlgText.collect_rollouts:[white bold] Stepped KL Controller. Returning")
+
             return True
 
     # instantiate the wrapped alg

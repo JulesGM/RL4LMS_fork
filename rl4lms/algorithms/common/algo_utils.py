@@ -4,6 +4,8 @@ import numpy as np
 import torch as th
 from torch import nn
 
+from rl4lms import conv_bfloat16
+
 
 def quantile_huber_loss(
     current_quantiles: th.Tensor,
@@ -167,7 +169,7 @@ def flat_grad(
 
 def tokenize_rewards(rewards: th.Tensor, tokenizer, device, round=1) -> th.Tensor:
     # implicitly quantizing to one of round^10 buckets
-    rewards = rewards.cpu().numpy().round(decimals=round)
+    rewards = conv_bfloat16(rewards.cpu()).numpy().round(decimals=round)
     rewards = [str(rew) for rew in rewards]
     ret = th.tensor([tokenizer.encode(rew, padding='max_length', max_length=5, truncation=True) for rew in rewards]).to(device).view(-1)
     replace_val = tokenizer.encode('0')[0]

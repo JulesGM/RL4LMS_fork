@@ -2,6 +2,7 @@ from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
+import logging
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -14,6 +15,8 @@ from torch.distributions import Categorical
 from transformers import AutoTokenizer, PreTrainedModel
 from transformers.modeling_utils import unwrap_model
 
+
+LOGGER = logging.getLogger(__name__)
 
 class PolicyType(Enum):
     CAUSAL = 0
@@ -226,13 +229,44 @@ class LMActorCriticPolicy(BasePolicy):
             generation_kwargs_ = gen_kwargs
 
         # generate
-        gen_output = unwrap_model(self._policy_model).generate(
+        ##################################################################################################
+        # Weird Jules Gagnon-Marchand, input_ids are floats
+        # Changes: change env type, cast this to long, ..
+        ##################################################################################################
+        if input_ids.dtype != torch.long:
+            long_input_ids = input_ids.long()
+            assert torch.isclose(long_input_ids.float(), input_ids).all()
+            input_ids = long_input_ids
+
+        if attention_mask.dtype != torch.long:
+            long_attention_mask = attention_mask.long()
+            assert torch.isclose(long_attention_mask.float(), attention_mask).all()
+            attention_mask = long_attention_mask
+
+
+        ##################################################################################################
+        # Jules Gagnon-Marchand Trying without unwrap model
+        ##################################################################################################
+        unwrapped_policy_model = unwrap_model(self._policy_model)
+        LOGGER.info(
+            f"[bold blue]base_policy:[bold white] lowest level of generate.\n"
+            f"\t- {unwrapped_policy_model.config._name_or_path  = }\n"
+            f"\t- {input_ids.shape                       = }\n"
+            f"\t- {attention_mask.shape                  = }\n"
+            f"\t- {type(unwrapped_policy_model).__name__ = }\n"
+            f"\t- {type(self._policy_model).__name__     = }\n"
+            # f"\t- {self._policy_model.device             = }\n"
+            f"\t- {self.get_policy_first_device()        = }\n"
+            # f"\t{generation_kwargs_ = }\n"
+        )
+        gen_output = unwrapped_policy_model.generate(
             inputs=input_ids.to(self.get_policy_first_device()),
             attention_mask=attention_mask.to(self.get_policy_first_device()),
             return_dict_in_generate=True,
             output_scores=True,
             **generation_kwargs_,
         )
+        LOGGER.debug("[bold blue]base_policy:[bold white] DONE: lowest level of generate")
 
         # number of tokens generated
         seq_length = len(gen_output["scores"])

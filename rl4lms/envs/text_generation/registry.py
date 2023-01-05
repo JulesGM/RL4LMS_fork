@@ -214,7 +214,7 @@ class AlgorithmRegistry:
         try:
             alg_cls = cls._registry[alg_id]
         except KeyError:
-            raise NotImplementedError
+            raise NotImplementedError(f"Algorithm \"{alg_id}\" not implemented. Choices: {cls._registry.keys()}")
         return alg_cls
 
     @classmethod
@@ -237,7 +237,9 @@ class WrapperRegistry:
         try:
             wrapper_def = cls._registry[alg_id]
         except KeyError:
-            raise NotImplementedError
+            raise NotImplementedError(
+                f"WrapperRegistry \"{alg_id}\" not implemented. Choices: {cls._registry.keys()}"
+            )
         return wrapper_def
 
     @classmethod
@@ -255,7 +257,9 @@ class PostProcessorRegistry:
         try:
             wrapper_def = cls._registry[post_processor_id]
         except KeyError:
-            raise NotImplementedError
+            raise NotImplementedError(
+                    f"PostProcessorRegistry \"{post_processor_id}\" not implemented. Choices: {cls._registry.keys()}"
+            )
         return wrapper_def
 
     @classmethod

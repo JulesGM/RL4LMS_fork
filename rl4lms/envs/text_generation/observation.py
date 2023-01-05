@@ -6,6 +6,8 @@ from transformers import AutoTokenizer
 from rl4lms.data_pools.text_generation_pool import Sample
 from copy import deepcopy
 
+from rl4lms import conv_bfloat16
+
 
 @dataclass
 class Observation:
@@ -39,12 +41,12 @@ class Observation:
         For stable baselines (only return tensor items)
         """
         dict_obs = {
-            "prompt_or_input_encoded_pt": self.prompt_or_input_encoded_pt.numpy().flatten(),
-            "prompt_or_input_attention_mask_pt": self.prompt_or_input_attention_mask_pt.numpy().flatten(),
-            "context_encoded_pt": self.context_encoded_pt.numpy().flatten(),
-            "context_attention_mask_pt": self.context_attention_mask_pt.numpy().flatten(),
-            "input_encoded_pt": self.input_encoded_pt.numpy().flatten(),
-            "input_attention_mask_pt": self.input_attention_mask_pt.numpy().flatten()
+            "prompt_or_input_encoded_pt": conv_bfloat16(self.prompt_or_input_encoded_pt).numpy().flatten(),
+            "prompt_or_input_attention_mask_pt": conv_bfloat16(self.prompt_or_input_attention_mask_pt).numpy().flatten(),
+            "context_encoded_pt": conv_bfloat16(self.context_encoded_pt).numpy().flatten(),
+            "context_attention_mask_pt": conv_bfloat16(self.context_attention_mask_pt).numpy().flatten(),
+            "input_encoded_pt": conv_bfloat16(self.input_encoded_pt).numpy().flatten(),
+            "input_attention_mask_pt": conv_bfloat16(self.input_attention_mask_pt).numpy().flatten()
 
         }
         return dict_obs

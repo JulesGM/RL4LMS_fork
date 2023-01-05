@@ -21,6 +21,7 @@ from pathlib import Path
 from rl4lms.envs.text_generation.reward import BatchedRewardFunction
 from typing import List, Dict, Any
 from rl4lms.envs.text_generation.metric import MeteorMetric
+from rl4lms import conv_bfloat16
 
 _model, _tokenizer = None, None
 
@@ -141,8 +142,8 @@ def get_scores(inputs, model_type, device=None, batch_size=1, verbose=False):
             model_output = model(
                 input_ids=input_ids, attention_mask=attention_mask, labels=targets
             )
-            logits_pos = model_output["logits"][:, 0, good_idx].cpu().numpy()
-            logits_neg = model_output["logits"][:, 0, bad_idx].cpu().numpy()
+            logits_pos = conv_bfloat16(model_output["logits"][:, 0, good_idx].cpu()).numpy()
+            logits_neg = conv_bfloat16(model_output["logits"][:, 0, bad_idx].cpu()).numpy()
             exp_logit_pos, exp_logit_neg = np.exp(logits_pos), np.exp(logits_neg)
             scores.extend(
                 list(

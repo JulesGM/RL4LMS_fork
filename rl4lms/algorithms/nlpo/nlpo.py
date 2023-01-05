@@ -22,6 +22,7 @@ from rl4lms.algorithms.common.maskable.utils import get_action_masks, is_masking
 from rl4lms.algorithms.nlpo.policies import CnnPolicy, MlpPolicy, MultiInputPolicy
 from rl4lms.envs.text_generation.logging_utils import Tracker
 from rl4lms.envs.text_generation.policy.base_policy import EvaluateActionsOutput
+from rl4lms import conv_bfloat16
 
 
 class NLPO(OnPolicyAlgorithm):
@@ -402,8 +403,8 @@ class NLPO(OnPolicyAlgorithm):
                 # and Schulman blog: http://joschu.net/blog/kl-approx.html
                 with th.no_grad():
                     log_ratio = log_prob - rollout_data.old_log_prob
-                    approx_kl_div = th.mean(
-                        (th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                    approx_kl_div = conv_bfloat16(th.mean(
+                        (th.exp(log_ratio) - 1) - log_ratio).cpu()).numpy()
                     approx_kl_divs.append(approx_kl_div)
 
                 if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:

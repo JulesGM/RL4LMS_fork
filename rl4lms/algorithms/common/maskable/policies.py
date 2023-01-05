@@ -16,6 +16,7 @@ from stable_baselines3.common.type_aliases import Schedule
 from torch import nn
 
 from rl4lms.algorithms.common.maskable.distributions import MaskableDistribution, make_masked_proba_distribution
+from rl4lms import conv_bfloat16
 
 
 class MaskableActorCriticPolicy(BasePolicy):
@@ -245,7 +246,7 @@ class MaskableActorCriticPolicy(BasePolicy):
             actions = self._predict(
                 observation, deterministic=deterministic, action_masks=action_masks)
             # Convert to numpy
-            actions = actions.cpu().numpy()
+            actions = conv_bfloat16(actions.cpu()).numpy()
 
         if isinstance(self.action_space, gym.spaces.Box):
             if self.squash_output:

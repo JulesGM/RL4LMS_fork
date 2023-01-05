@@ -12,7 +12,8 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
 from rl4lms.envs.text_generation.logging_utils import Tracker
 from rl4lms.envs.text_generation.policy.base_policy import EvaluateActionsOutput
-
+from rl4lms import conv_bfloat16
+from transformers.modeling_utils import unwrap_model
 
 class PPO(OnPolicyAlgorithm):
     """
@@ -196,12 +197,24 @@ class PPO(OnPolicyAlgorithm):
         clip_fractions = []
 
         continue_training = True
+        policy_model_dtype = unwrap_model(self.policy._policy_model).dtype
 
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for batch_ix, rollout_data in enumerate(list(self.rollout_buffer.get(self.batch_size))):
+                new_rollout_data = []
+                for x in rollout_data:
+                    if isinstance(x, th.Tensor):
+                        new_rollout_data.append(x.to(policy_model_dtype))
+                    elif isinstance(x, dict):
+                        new_rollout_data.append({k: v.to(policy_model_dtype) for k, v in x.items()})
+                    else:
+                        raise ValueError(type(x))
+                        
+                rollout_data = rollout_data.__class__(*new_rollout_data)
+
                 # self.verify_rollout_data(rollout_data)
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
@@ -239,7 +252,7 @@ class PPO(OnPolicyAlgorithm):
                 # Logging
                 pg_losses.append(policy_loss.item())
                 clip_fraction = th.mean(
-                    (th.abs(ratio - 1) > clip_range).float()).item()
+                    (th.abs(ratio - 1) > clip_range).to(policy_model_dtype)).item()
                 clip_fractions.append(clip_fraction)
 
                 if self.clip_range_vf is None:
@@ -272,8 +285,8 @@ class PPO(OnPolicyAlgorithm):
                 # and Schulman blog: http://joschu.net/blog/kl-approx.html
                 with th.no_grad():
                     log_ratio = log_prob - rollout_data.old_log_prob
-                    approx_kl_div = th.mean(
-                        (th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                    approx_kl_div = conv_bfloat16(th.mean(
+                        (th.exp(log_ratio) - 1) - log_ratio).cpu()).numpy()
                     approx_kl_divs.append(approx_kl_div)
 
                 if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
