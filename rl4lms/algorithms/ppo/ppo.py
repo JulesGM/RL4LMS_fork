@@ -1,3 +1,4 @@
+import logging
 import warnings
 from typing import Any, Dict, Optional, Type, Union
 
@@ -14,6 +15,8 @@ from rl4lms.envs.text_generation.logging_utils import Tracker
 from rl4lms.envs.text_generation.policy.base_policy import EvaluateActionsOutput
 from rl4lms import conv_bfloat16
 from transformers.modeling_utils import unwrap_model
+
+LOGGER = logging.getLogger(__name__)
 
 class PPO(OnPolicyAlgorithm):
     """
@@ -298,7 +301,9 @@ class PPO(OnPolicyAlgorithm):
 
                 # Optimization step
                 self.policy.optimizer.zero_grad()
+                LOGGER.info(f"PPO.BACKWARDS -> ENTRY")
                 loss.backward()
+                LOGGER.info(f"PPO.BACKWARDS -> EXIT")
                 # Clip grad norm
                 th.nn.utils.clip_grad_norm_(
                     self.policy.parameters(), self.max_grad_norm)

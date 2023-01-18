@@ -23,12 +23,7 @@ class Tracker:
                  experiment_name: str,
                  entity_name: str = None,
                  wandb_log: bool = False,
-                 log_level: int = logging.DEBUG,
-<<<<<<< HEAD
-   ):
-=======
-        ):
->>>>>>> aa5d337c4c587049e039d572042bf5c95926c3be
+                 log_level: int = logging.DEBUG):
         self._log_level = log_level
         self._base_path_to_store_results = base_path_to_store_results
         self._config = run_config
