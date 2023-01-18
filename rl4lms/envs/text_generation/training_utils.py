@@ -374,6 +374,9 @@ class SupervisedTrainer:
             data_collator=data_collator,
             train_dataset=self._tokenized_dataset,
             callbacks=[self._eval_callback],
+            deepspeed=self._alg_config.get(
+                "deepspeed_config_path", None
+            ),
         )
 
     def train_and_eval(self):
