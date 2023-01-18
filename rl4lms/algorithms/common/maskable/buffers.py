@@ -6,6 +6,8 @@ Code adapted from https://github.com/DLR-RM/stable-baselines3
 
 from typing import Generator, NamedTuple, Optional, Union
 
+
+import accelerate
 import numpy as np
 import torch
 import torch as th
@@ -13,6 +15,8 @@ from gym import spaces
 from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
 from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.vec_env import VecNormalize
+
+
 
 class MaskableRolloutBufferSamples(NamedTuple):
     observations: th.Tensor
@@ -32,6 +36,7 @@ class MaskableDictRolloutBufferSamples(MaskableRolloutBufferSamples):
     advantages: th.Tensor
     returns: th.Tensor
     action_masks: th.Tensor
+
 
 
 class MaskableRolloutBuffer(RolloutBuffer):
@@ -80,6 +85,16 @@ class MaskableRolloutBuffer(RolloutBuffer):
         super().add(*args, **kwargs)
 
     def get(self, batch_size: Optional[int] = None) -> Generator[MaskableRolloutBufferSamples, None, None]:
+        """
+        
+        What this does: 
+        # 1 shuffle the indices of the buffer
+        # 2 swap and flatten the data if it hasn't been done yet
+        # 3 yield the data in minibatches if batch_size is not None
+
+        So it's basically a dataloader. 
+
+        """
         assert self.full, ""
         indices = np.random.permutation(self.buffer_size * self.n_envs)
         # Prepare the data
@@ -214,13 +229,196 @@ class MaskableDictRolloutBuffer(DictRolloutBuffer):
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> MaskableDictRolloutBufferSamples:
 
         return MaskableDictRolloutBufferSamples(
-            observations={key: self.to_torch(obs[batch_inds]) for (
-                key, obs) in self.observations.items()},
+            observations={key: self.to_torch(obs[batch_inds]) for (key, obs) in self.observations.items()},
             actions=self.to_torch(self.actions[batch_inds]),
             old_values=self.to_torch(self.values[batch_inds].flatten()),
             old_log_prob=self.to_torch(self.log_probs[batch_inds].flatten()),
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
-            action_masks=self.to_torch(
-                self.action_masks[batch_inds].reshape(-1, self.mask_dims)),
+            action_masks=self.to_torch(self.action_masks[batch_inds].reshape(-1, self.mask_dims)),
         )
+
+
+class MaskableDictRolloutDataset(MaskableDictRolloutBuffer, torch.utls.data.Dataset):
+    """Contains the data iterated on by the Dataloader.
+
+    Accelerate:
+    This class does not handle any parallelism. 
+    That is handled by the Dataloader & its Accelerate wrapper. 
+    It doesn't know if we're using accelerate.
+
+    """
+
+    def get(self, *args, **kwargs):
+        raise RuntimeError(
+            "Should not be called. "
+            "Use __getitem__ or the Dataloader version."
+        )
+
+    def _prep_data(self):
+        assert self.full, ""
+        # Prepare the data
+        if not self.generator_ready:
+
+            for key, obs in self.observations.items():
+                self.observations[key] = self.swap_and_flatten(obs)
+
+            _tensor_names = [
+                "actions", 
+                "values", 
+                "log_probs",
+                "advantages", 
+                "returns", 
+                "action_masks"
+            ]
+
+            for tensor in _tensor_names:
+                self.__dict__[tensor] = self.swap_and_flatten(
+                    self.__dict__[tensor])
+
+            self.generator_ready = True
+
+    def __len__(self):
+        target_len = self.buffer_size * self.n_envs
+        _tensor_names = [
+                "actions", 
+                "values", 
+                "log_probs",
+                "advantages", 
+                "returns", 
+                "action_masks"
+            ]
+
+        for name in _tensor_names:
+            assert len(self.__dict__(name)) == target_len, (
+                f"Tensor size is unexpected: {name = }, "
+                f"{len(self.__dict__(name)) = }, {target_len = }"
+            )
+
+        return target_len
+
+    def __getitem__(self, idx):
+        assert self.generator_ready
+        return self._get_samples(idx)
+
+
+    class MaskableDictRolloutDataloader(torch.utils.data.DataLoader):
+        """The class to replace MaskableDictRolloutBuffer for Accelerate.
+
+        The class is also functional without an Accelerator instance.
+
+        Accelerate:
+        This class knows about the accelerator.
+        Its job is to keep the buffers in sync and to be wrapped by `Accelerator.prepare`
+        or `Accelerator.prepare_data_loader`.
+
+        """
+        
+        def __init__(self, *args, accelerator: Optional[accelerate.Accelerator], **kwargs):
+            super().__init__(*args, **kwargs)
+            self.accelerator = accelerator
+
+        def reset(self):
+            """Empties the buffers.
+
+            Accelerate: 
+            Each process can release its own buffers. 
+            No change needed.
+
+            """
+            self.dataset.reset()
+
+        def add(self, *args, **kwargs):
+            """Adds new data to the buffer.
+
+            Accelerate: 
+            We send the new data to each process.            
+
+            """
+            if self.accelerator is not None:
+                for i, v in enumerate(args):
+                    if isinstance(v, torch.Tensor):
+                        args[i] = self.accelerator.gather(v)
+                for k, v in kwargs.items():
+                    if isinstance(v, torch.Tensor):
+                        kwargs[k] = self.accelerator.gather(v)
+
+            self.dataset.add(*args, **kwargs)
+
+        def get(self, batch_size):
+            """Returns a generator that yields batches.
+
+            Accelerate:
+            We return outself, which is a dataloader that is wrapped
+            by Accelerator.
+            The only issue is if batch_size is `None`.
+
+            # TODO: fix this.
+
+            """
+            assert batch_size is not None, "A batch size of None is not currently supported."
+
+            return self
+
+        def __iter__(self):
+            """Returns a generator that yields batches, prepares the data if needed.
+            
+            Accelerate: 
+            We prepare the data then let the wrapped 
+            dataloader handle the rest.
+
+            """
+            self.dataset._prep_data()
+            return super().__iter__()
+
+        @property
+        def rewards(self):
+            """Return the rollout buffer rewards.
+            
+            Accelerate:
+            They're all the same on the different processes, so we can just
+            return the process-local one.
+            
+            """
+            return self.dataset.rewards
+
+        @rewards.setter
+        def rewards(self, new_val):
+            """Set the rollout buffer rewards.
+            
+            Accelerate:
+            We sync them across the processes.
+            
+            """
+            if self.accelerator is not None:
+                self.dataset.rewards = self.accelerator.gather(new_val)
+            else:
+                self.dataset.rewards = new_val
+
+        @property
+        def actions(self):
+            return self.dataset.actions
+        
+        @property
+        def values(self):
+            return self.dataset.values
+        
+        @property
+        def log_probs(self):
+            return self.dataset.log_probs
+
+        @property
+        def advantages(self):
+            return self.dataset.advantages
+
+        @property
+        def returns(self):
+            return self.dataset.returns
+    
+        @property
+        def action_masks(self):
+            return self.dataset.action_masks
+        
+        @property
+        def full(self):
+            return self.dataset.full
