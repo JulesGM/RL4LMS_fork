@@ -1,7 +1,8 @@
 from functools import partial
+import logging
 from typing import Any, Dict, List
-import numpy as np
 
+import numpy as np
 from rl4lms.data_pools.text_generation_pool import Sample
 from rl4lms.envs.text_generation.env import TextGenEnv
 from rl4lms.envs.text_generation.evaluation_utils import evaluate_on_samples
@@ -41,6 +42,9 @@ from rl4lms.envs.text_generation.utils_supervised import (
 )
 from rl4lms.envs.text_generation.warm_start import TrainerWarmStartMixin
 
+LOGGER = logging.getLogger(__name__)
+DEEPSPEED_KEY = "supervised_deepspeed"
+OUTPUT_DIR_KEY = "supervised_output_dir"
 
 def build_tokenizer(tokenizer_config: Dict[str, Any]):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_config["model_name"])
@@ -247,30 +251,32 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
         iter_start = self._trainer_state["current_iter"]
         self._evaluate_on_datapools(epoch=iter_start)
 
-        # # train for given number of iters
-        # for epoch in range(iter_start, self._n_iters):
-        #     # current state
-        #     self._trainer_state["current_iter"] = epoch
+        assert False
 
-        #     # inner rollout and learn loop for on-policy algorithm
-        #     self._alg.learn(self._n_steps_per_iter)
+        # train for given number of iters
+        for epoch in range(iter_start, self._n_iters):
+            # current state
+            self._trainer_state["current_iter"] = epoch
 
-        #     # save the policy checkpoint
-        #     if (epoch + 1) % self._train_eval_config.get("save_every", 20) == 0:
-        #         self.save_trainer_state(
-        #             self._tracker, self._alg.policy, self._trainer_state)
+            # inner rollout and learn loop for on-policy algorithm
+            self._alg.learn(self._n_steps_per_iter)
 
-        #     # evaluate on val set in the given intervals
-        #     if (epoch + 1) % self._train_eval_config["eval_every"] == 0:
-        #         self._evaluate_on_datapools(epoch=epoch, splits=["val"])
+            # save the policy checkpoint
+            if (epoch + 1) % self._train_eval_config.get("save_every", 20) == 0:
+                self.save_trainer_state(
+                    self._tracker, self._alg.policy, self._trainer_state)
 
-        # # finally evaluate on val and test samples
-        # self._evaluate_on_datapools(epoch=epoch)
+            # evaluate on val set in the given intervals
+            if (epoch + 1) % self._train_eval_config["eval_every"] == 0:
+                self._evaluate_on_datapools(epoch=epoch, splits=["val"])
 
-        # # save model here - we save only the language model
-        # if self._tracker is not None:
-        #     self._tracker.save_auto_model(
-        #         self._alg.policy.get_language_model())
+        # finally evaluate on val and test samples
+        self._evaluate_on_datapools(epoch=epoch)
+
+        # save model here - we save only the language model
+        if self._tracker is not None:
+            self._tracker.save_auto_model(
+                self._alg.policy.get_language_model())
 
 
 class SupervisedTrainer:
@@ -280,6 +286,7 @@ class SupervisedTrainer:
 
     def __init__(
         self,
+        *,
         tokenizer_config: Dict[str, Any],
         datapool_config: Dict[str, Any],
         train_eval_config: Dict[str, Any],
@@ -293,7 +300,11 @@ class SupervisedTrainer:
         self._tracker = tracker
         self._setup()
 
-    def _evaluate_on_datapools(self, epoch: int, splits: List[str] = ["val", "test"]):
+    def _evaluate_on_datapools(
+        self, 
+        epoch: int, 
+        splits: List[str] = ["val", "test"]
+    ):
         for split in splits:
             evaluate_supervised(
                 model=self._model,
@@ -324,7 +335,9 @@ class SupervisedTrainer:
         )
         preprocess_fn = partial(preprocess_fn, tokenizer=self._tokenizer)
         self._tokenized_dataset = self._train_dataset.map(
-            preprocess_fn, batched=True, remove_columns=self._train_dataset.column_names
+            preprocess_fn, 
+            batched=True, 
+            remove_columns=self._train_dataset.column_names
         )
         model_cls = (
             AutoModelForCausalLM
@@ -333,7 +346,6 @@ class SupervisedTrainer:
         )
         self._gen_kwargs = self._alg_config["generation_kwargs"]
         self._model = model_cls.from_pretrained(self._alg_config["model_name"])
-        self._model.parallelize()
         self._eval_batch_size = self._train_eval_config["eval_batch_size"]
 
         # setting max prompt length
@@ -361,12 +373,23 @@ class SupervisedTrainer:
         train_args = self._alg_config["training_args"]
         train_args["output_dir"] = self._tracker.checkpoint_base_path
         train_args["seed"] = np.random.randint(1e2)  # random seed
-        self._train_args = TrainingArguments(**train_args)
         data_collator = (
             DataCollatorForLanguageModeling(self._tokenizer, mlm=False)
             if self._alg_config["model_type"] == "causal"
             else DataCollatorForSeq2Seq(self._tokenizer, self._model)
         )
+        if (
+            DEEPSPEED_KEY in self._train_eval_config and 
+            self._train_eval_config[DEEPSPEED_KEY]
+        ):
+            LOGGER.debug("[bold red]SupervisedTrainer: [bold white]Using deepspeed")
+            train_args["output_dir"] = self._train_eval_config[OUTPUT_DIR_KEY]
+            train_args["deepspeed"] = self._train_eval_config[DEEPSPEED_KEY]
+        else:
+            self._model.parallelize()
+
+        assert train_args["deepspeed"], train_args["deepspeed"]
+        self._train_args = TrainingArguments(**train_args)
         self._trainer = Trainer(
             model=self._model,
             tokenizer=self._tokenizer,
@@ -374,9 +397,6 @@ class SupervisedTrainer:
             data_collator=data_collator,
             train_dataset=self._tokenized_dataset,
             callbacks=[self._eval_callback],
-            deepspeed=self._alg_config.get(
-                "deepspeed_config_path", None
-            ),
         )
 
     def train_and_eval(self):
