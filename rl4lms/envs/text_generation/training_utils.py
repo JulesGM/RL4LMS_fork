@@ -226,10 +226,12 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
             self._alg.optimizer,
             self._dataloaders["val"],
             self._dataloaders["test"],
-        ) = self.accelerator.prepare(self._alg.policy, 
-                                     optimizer, 
-                                     self._dataloaders["val"], 
-                                     self._dataloaders["test"])
+        ) = self.accelerator.prepare(
+            self._alg.policy, 
+            optimizer, 
+            self._dataloaders["val"], 
+            self._dataloaders["test"]
+        )
 
     def _evaluate_on_datapools(self, epoch: int, splits: List[str] = ["val", "test"]):
         for split in splits:
