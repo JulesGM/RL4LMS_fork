@@ -243,9 +243,9 @@ class MaskableDictRolloutDataset(MaskableDictRolloutBuffer, torch.utls.data.Data
     """Contains the data iterated on by the Dataloader.
 
     Accelerate:
-    This class does not handle any parallelism. 
-    That is handled by the Dataloader & its Accelerate wrapper. 
-    It doesn't know if we're using accelerate.
+        - This class does not handle any parallelism. 
+        - That is handled by the Dataloader & its Accelerate wrapper. 
+        - It doesn't know if we're using accelerate.
 
     """
 
@@ -302,123 +302,146 @@ class MaskableDictRolloutDataset(MaskableDictRolloutBuffer, torch.utls.data.Data
         return self._get_samples(idx)
 
 
-    class MaskableDictRolloutDataloader(torch.utils.data.DataLoader):
-        """The class to replace MaskableDictRolloutBuffer for Accelerate.
-
-        The class is also functional without an Accelerator instance.
-
-        Accelerate:
-        This class knows about the accelerator.
-        Its job is to keep the buffers in sync and to be wrapped by `Accelerator.prepare`
-        or `Accelerator.prepare_data_loader`.
+    def __iter__(self):
+        """Returns a generator that yields batches, prepares the data if needed.
+        
+        Accelerate: 
+        We prepare the data then let the wrapped 
+        dataloader handle the rest.
 
         """
+        self.dataset._prep_data()
+        return super().__iter__()
+
+    @property
+    def rewards(self):
+        """Return the rollout buffer rewards.
         
-        def __init__(self, *args, accelerator: Optional[accelerate.Accelerator], **kwargs):
-            super().__init__(*args, **kwargs)
-            self.accelerator = accelerator
-
-        def reset(self):
-            """Empties the buffers.
-
-            Accelerate: 
-            Each process can release its own buffers. 
-            No change needed.
-
-            """
-            self.dataset.reset()
-
-        def add(self, *args, **kwargs):
-            """Adds new data to the buffer.
-
-            Accelerate: 
-            We send the new data to each process.            
-
-            """
-            if self.accelerator is not None:
-                for i, v in enumerate(args):
-                    if isinstance(v, torch.Tensor):
-                        args[i] = self.accelerator.gather(v)
-                for k, v in kwargs.items():
-                    if isinstance(v, torch.Tensor):
-                        kwargs[k] = self.accelerator.gather(v)
-
-            self.dataset.add(*args, **kwargs)
-
-        def get(self, batch_size):
-            """Returns a generator that yields batches.
-
-            Accelerate:
-            We return outself, which is a dataloader that is wrapped
-            by Accelerator.
-            The only issue is if batch_size is `None`.
-
-            # TODO: fix this.
-
-            """
-            assert batch_size is not None, "A batch size of None is not currently supported."
-
-            return self
-
-        def __iter__(self):
-            """Returns a generator that yields batches, prepares the data if needed.
-            
-            Accelerate: 
-            We prepare the data then let the wrapped 
-            dataloader handle the rest.
-
-            """
-            self.dataset._prep_data()
-            return super().__iter__()
-
-        @property
-        def rewards(self):
-            """Return the rollout buffer rewards.
-            
-            Accelerate:
-            They're all the same on the different processes, so we can just
-            return the process-local one.
-            
-            """
-            return self.dataset.rewards
-
-        @rewards.setter
-        def rewards(self, new_val):
-            """Set the rollout buffer rewards.
-            
-            Accelerate:
-            We sync them across the processes.
-            
-            """
-            if self.accelerator is not None:
-                self.dataset.rewards = self.accelerator.gather(new_val)
-            else:
-                self.dataset.rewards = new_val
-
-        @property
-        def actions(self):
-            return self.dataset.actions
+        Accelerate:
+        They're all the same on the different processes, so we can just
+        return the process-local one.
         
-        @property
-        def values(self):
-            return self.dataset.values
+        """
+        return self.dataset.rewards
+
+    @rewards.setter
+    def rewards(self, new_val):
+        """Set the rollout buffer rewards.
         
-        @property
-        def log_probs(self):
-            return self.dataset.log_probs
+        Accelerate:
+        We sync them across the processes.
+        
+        """
+        if self.accelerator is not None:
+            self.dataset.rewards = self.accelerator.gather(new_val)
+        else:
+            self.dataset.rewards = new_val
 
-        @property
-        def advantages(self):
-            return self.dataset.advantages
+    @property
+    def actions(self):
+        return self.dataset.actions
 
-        @property
-        def returns(self):
-            return self.dataset.returns
+    @property
+    def values(self):
+        return self.dataset.values
+
+    @property
+    def log_probs(self):
+        return self.dataset.log_probs
+
+    @property
+    def advantages(self):
+        return self.dataset.advantages
+
+    @property
+    def returns(self):
+        return self.dataset.returns
+
+    @property
+    def action_masks(self):
+        return self.dataset.action_masks
+
+    @property
+    def full(self):
+        return self.dataset.full
+
+
+
+
+class MaskableDictRolloutDataloaderBuilder:
+    """The class to replace MaskableDictRolloutBuffer for Accelerate.
+
+    Creates a dataloader that is wrapped by the Accelerator when .get is called.
+    The class is also functional without an Accelerator instance, in which case
+    it just returns a dataloader.
+
+    Accelerate:
+    - This class knows about the accelerator.
+    - Its job is to keep the buffers in sync and to be wrapped by `Accelerator.prepare`
+        or `Accelerator.prepare_data_loader`.
+
+    """
     
-        @property
-        def action_masks(self):
-            return self.dataset.action_masks
+    def __init__(
+        self,
+        dataset: MaskableDictRolloutDataset, 
+        accelerator: Optional[accelerate.Accelerator],
+        # batch_size is not optional for the dataloader, so we make it required here.
+        batch_size: int, 
+        **dataloader_kwargs,
+    ):
+        self._dataset = dataset
+        self._accelerator = accelerator
+        self._dataloader_kwargs = dataloader_kwargs
+        self._dataloader_kwargs["batch_size"] = batch_size
+
+
+    def reset(self):
+        """Empties the buffers.
+
+        Accelerate: 
+        Each process can release its own buffers. 
+        No change needed.
+
+        """
+        self._dataset.reset()
+
+    def add(self, *args, **kwargs):
+        """Adds new data to the buffer.
+
+        Accelerate: 
+        We send the new data to each process.            
+
+        """
+        if self._accelerator:
+            for i, v in enumerate(args):
+                if isinstance(v, torch.Tensor):
+                    args[i] = self._accelerator.gather(v)
+            for k, v in kwargs.items():
+                if isinstance(v, torch.Tensor):
+                    kwargs[k] = self._accelerator.gather(v)
+
+        self._dataset.add(*args, **kwargs)
+
+    def get(self, batch_size):
+        """Returns a generator that yields batches.
+
+        Accelerate:
+        We return outself, which is a dataloader that is wrapped
+        by Accelerator.
+        The only issue is if batch_size is `None`.
+
+        """
+        assert batch_size is not None, "A batch size of None is not currently supported."
+
+        self._dataset._prep_data()
         
-        @property
-        def full(self):
-            return self.dataset.full
+        dataloader = torch.utils.data.DataLoader(
+            self._dataset, 
+            **self._dataloader_kwargs
+        )
+
+        if self._accelerator:
+            return self._accelerator.prepare_data_loader(dataloader)
+        else:
+            return dataloader
