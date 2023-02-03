@@ -1,6 +1,6 @@
 from functools import partial
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from rl4lms.data_pools.text_generation_pool import Sample
@@ -20,6 +20,7 @@ from rl4lms.envs.text_generation.registry import (
     WrapperRegistry,
 )
 from rl4lms.envs.text_generation.reward import RewardFunction
+from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env.dummy_vec_env import DummyVecEnv
 from transformers import (
@@ -59,7 +60,7 @@ def build_tokenizer(tokenizer_config: Dict[str, Any]):
 
 def build_reward_fn(reward_config: Dict[str, Any]):
     reward_fn = RewardFunctionRegistry.get(
-        reward_config["id"], reward_config.get("args", {})
+        reward_config["id"], reward_config.get("args", {},)
     )
     return reward_fn
 
@@ -114,6 +115,7 @@ def build_env(
 
 
 def build_alg(
+    accelerator: Accelerator,
     alg_config: Dict[str, Any],
     env: TextGenEnv,
     tracker: Tracker,
@@ -134,12 +136,14 @@ def build_alg(
     alg_kwargs = {**alg_kwargs, **alg_config.get("args")}
     wrapper = WrapperRegistry.get(alg_config["id"])
     alg = wrapper(
-        alg_cls,
-        alg_kwargs,
-        alg_config["kl_div"]["coeff"],
-        tracker,
-        alg_config["kl_div"].get("target_kl", None),
-        alg_config["kl_div"].get("norm_reward", False),
+        accelerator=accelerator,
+        alg_class=alg_cls,
+        alg_kwargs=alg_kwargs,
+        kl_coeff=alg_config["kl_div"]["coeff"],
+        tracker=tracker,
+        target_kl=alg_config["kl_div"].get("target_kl", None),
+        norm_reward=alg_config["kl_div"].get("norm_reward", False),
+        dataloader_kwargs=alg_config.get("dataloader_kwargs", {}),
     )
     alg.load_from_dict(alg_state)
     return alg
@@ -152,26 +156,28 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
 
     def __init__(
         self,
-        tokenizer_config: Dict[str, Any],
+        *,
         datapool_config: Dict[str, Any],
-        reward_config: Dict[str, Any],
         env_config: Dict[str, Any],
-        on_policy_alg_config: Dict[str, Any],
-        train_eval_config: Dict[str, Any],
-        tracker: Tracker = None,
         experiment_name: str = "",
+        on_policy_alg_config: Dict[str, Any],
+        reward_config: Dict[str, Any],
+        tokenizer_config: Dict[str, Any],
+        tracker: Tracker = None,
+        train_eval_config: Dict[str, Any],
     ):
-        self._tokenizer_config = tokenizer_config
         self._datapool_config = datapool_config
-        self._reward_config = reward_config
         self._env_config = env_config
-        self._on_policy_alg_config = on_policy_alg_config
-        self._train_eval_config = train_eval_config
-        self._tracker = tracker
         self._experiment_name = experiment_name
+        self._on_policy_alg_config = on_policy_alg_config
+        self._reward_config = reward_config
+        self._tokenizer_config = tokenizer_config
+        self._tracker = tracker
+        self._train_eval_config = train_eval_config
         self._setup()
 
     def _setup(self):
+
         # load trainer state from available previous checkpoint if available
         self.load_trainer_state(self._tracker)
 
@@ -186,31 +192,39 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
             self._tokenizer,
             self._samples_by_split["train"],
         )
-        self._alg = build_alg(
-            self._on_policy_alg_config,
-            self._env,
-            self._tracker,
-            self._policy_state_dict,
-            self._alg_state_dict,
-        )
 
         # extract train params
         self._max_episode_length = self._env_config["args"]["max_episode_length"]
         self._max_prompt_length = self._env_config["args"]["max_prompt_length"]
         self._eval_batch_size = self._train_eval_config["eval_batch_size"]
         self._n_iters = int(self._train_eval_config["n_iters"])
-        self._n_steps_per_iter = self._env.num_envs * self._alg.n_steps
 
         # gen kwargs for evaluation (if it is different from rollout gen kwargs)
         self._eval_gen_kwargs = self._train_eval_config.get("generation_kwargs", None)
 
+
+        self._accelerator = Accelerator()
+
         # prepare for accelerate
+        self._alg = build_alg(
+            accelerator=self._accelerator,
+            alg_config=self._on_policy_alg_config,
+            env=self._env,
+            tracker=self._tracker,
+            policy_state=self._policy_state_dict,
+            alg_state=self._alg_state_dict,
+        )
+        self._n_steps_per_iter = self._env.num_envs * self._alg.n_steps
+
+        assert isinstance(self._alg.policy, BasePolicy), type(self._alg.policy).mro()
         self._prepare_accelerate()
+        assert isinstance(self._alg.policy, BasePolicy), type(self._alg.policy).mro()
+
+        
 
     def _prepare_accelerate(self):
-        # hold accelerator objects here
-        self.accelerator = Accelerator()
 
+        assert isinstance(self._alg.policy, BasePolicy), type(self._alg.policy).mro()
         # create optimizer first
         optimizer = self._alg.policy.setup_optimizer()
 
@@ -219,6 +233,9 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
             "val": create_dataloader(self._samples_by_split["val"], self._eval_batch_size),
             "test": create_dataloader(self._samples_by_split["test"], self._eval_batch_size),
         }
+        assert isinstance(self._accelerator.unwrap_model(self._alg.policy), BasePolicy), (
+            type(self._alg.policy).mro()
+        )
 
         # prepare policy, optimizer and dataloader
         (
@@ -226,14 +243,29 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
             self._alg.optimizer,
             self._dataloaders["val"],
             self._dataloaders["test"],
-        ) = self.accelerator.prepare(
-            self._alg.policy, 
-            optimizer, 
-            self._dataloaders["val"], 
-            self._dataloaders["test"]
+            *accelerated_models,
+        ) = self._accelerator.prepare(self._alg.policy,
+                                      optimizer, 
+                                      self._dataloaders["val"], 
+                                      self._dataloaders["test"],
+                                      *self._reward_fn._models.values())
+
+        assert isinstance(self._accelerator.unwrap_model(self._alg.policy), BasePolicy), (
+            type(self._alg.policy).mro()
         )
 
+        # Dicts are orderd, this is fine
+        for key, accelerated in zip(self._reward_fn._models, accelerated_models):
+            self._reward_fn._models[key] = accelerated
+
+
+
     def _evaluate_on_datapools(self, epoch: int, splits: List[str] = ["val", "test"]):
+        
+        LOGGER.debug(f"[blue bold]OnPolicyTrainer._evaluate_on_datapools: [white]Entry - {splits}")
+
+        assert isinstance(self._alg.policy, BasePolicy), type(self._alg.policy).mro()
+
         for split in splits:
             evaluate_on_samples(
                 policy=self._alg.policy,
@@ -243,10 +275,13 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
                 metrics=self._metrics,
                 epoch=epoch,
                 split_name=split,
-                accelerator=self.accelerator,
+                accelerator=self._accelerator,
                 tracker=self._tracker,
                 gen_kwargs=self._eval_gen_kwargs,
             )
+
+        LOGGER.debug(f"[blue bold]OnPolicyTrainer._evaluate_on_datapools: [white]Exit - {splits}")
+    
 
     def train_and_eval(self):
         # evaluate on val and test set before fine-tuning once
@@ -404,6 +439,8 @@ class SupervisedTrainer:
     def train_and_eval(self):
         # evaluate on val and test set before fine-tuning once
         self._evaluate_on_datapools(epoch=0)
+
+        assert False
 
         # train using HF trainer
         self._trainer.train()

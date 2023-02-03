@@ -1,4 +1,5 @@
 from enum import Enum
+import logging
 from typing import Any, Dict, Optional, Tuple, List, Union
 import torch
 from gym.spaces import Discrete
@@ -17,25 +18,29 @@ from rl4lms.algorithms.common.maskable.logits_processor import MaskLogitsProcess
 from rl4lms.envs.text_generation.warm_start import ActorCriticWarmStartMixin, ActorOnlyWarmStartMixin, MaskableActorCriticWarmStartMixin
 from transformers.modeling_utils import unwrap_model
 
+LOGGER = logging.getLogger(__name__)
+
 class PolicyType(Enum):
     CAUSAL = 0
     SEQ2SEQ = 1
 
 
 class LMActorCriticPolicy(BasePolicy, ActorCriticWarmStartMixin):
-    def __init__(self, observation_space: DictSpace,
-                 action_space: Discrete,
-                 lr_schedule: Schedule,
-                 model_name: str,
-                 optimizer_kwargs: Dict[str, Any] = {},
-                 weight_decay: float = 1e-6,
-                 use_sde: bool = None,
-                 apply_model_parallel: bool = True,
-                 optimizer_class: torch.optim.Optimizer = torch.optim.AdamW,
-                 generation_kwargs: Dict[str, Any] = {},
-                 prompt_truncation_side: str = "left",
-                 state_dict: Dict[str, Any] = None
-                 ):
+    def __init__(
+            self, 
+            observation_space: DictSpace,
+            action_space: Discrete,
+            lr_schedule: Schedule,
+            model_name: str,
+            optimizer_kwargs: Dict[str, Any] = {},
+            weight_decay: float = 1e-6,
+            use_sde: bool = None,
+            apply_model_parallel: bool = True,
+            optimizer_class: torch.optim.Optimizer = torch.optim.AdamW,
+            generation_kwargs: Dict[str, Any] = {},
+            prompt_truncation_side: str = "left",
+            state_dict: Dict[str, Any] = None,
+        ):
         super().__init__(observation_space, action_space)
         self._action_space = action_space
         self._apply_model_parallel = apply_model_parallel
@@ -47,8 +52,10 @@ class LMActorCriticPolicy(BasePolicy, ActorCriticWarmStartMixin):
         self._generation_kwargs = generation_kwargs
         self._prompt_truncation_side = prompt_truncation_side
 
-    def _build_model_heads(self,
-                           model_name: str):
+    def _build_model_heads(
+        self,
+        model_name: str
+    ):
         self._policy_model = AutoModelForCausalLM.from_pretrained(
             model_name)
         self._policy_model.__class__ = override_generation_routines(
@@ -60,15 +67,6 @@ class LMActorCriticPolicy(BasePolicy, ActorCriticWarmStartMixin):
 
         self._value_head = nn.Linear(
             self._value_model.config.hidden_size, 1, bias=False)
-
-        # apply model parallel
-        if torch.cuda.is_available() and self._apply_model_parallel:
-            if self._policy_model.is_parallelizable:
-                self._policy_model.parallelize()
-                self._ref_model.parallelize()
-            if self._value_model.is_parallelizable:
-                self._value_model.parallelize()
-        self._value_head = self._value_head.to(self.device)
 
     def _setup_optimizer(self, optimizer_kwargs: Dict[str, Any],
                          weight_decay: float, optimizer_class: torch.optim):
@@ -263,12 +261,16 @@ class LMActorCriticPolicy(BasePolicy, ActorCriticWarmStartMixin):
             return model.config.is_encoder_decoder
 
 
-    def generate(self, tokenizer: AutoTokenizer,
-                 texts: List[str] = None,
-                 max_prompt_length: int = None,
-                 input_ids: torch.tensor = None,
-                 attention_mask: torch.tensor = None,
-                 gen_kwargs: Dict[str, Any] = None):
+    def generate(
+        self, 
+        tokenizer: AutoTokenizer,
+        texts: List[str] = None,
+        max_prompt_length: int = None,
+        input_ids: torch.tensor = None,
+        attention_mask: torch.tensor = None,
+        gen_kwargs: Dict[str, Any] = None,
+    ):
+        LOGGER.debug(f"[bold blue]policy.generate:[white] entry")
 
         # if it different from rollout gen kwargs
         if gen_kwargs is None:
@@ -277,20 +279,23 @@ class LMActorCriticPolicy(BasePolicy, ActorCriticWarmStartMixin):
         # switch to eval
         self._policy_model.eval()
 
-        if input_ids is None and\
-                attention_mask is None and\
-                texts is not None and \
-                max_prompt_length is not None:
+        if (
+            input_ids         is None and
+            attention_mask    is None and
+            texts             is not None and 
+            max_prompt_length is not None
+        ):
             # override truncation side for prompt
             prev_truncation_side = tokenizer.truncation_side
             tokenizer.truncation_side = self._prompt_truncation_side
-            encodings = tokenizer(texts,
-                                  padding="max_length",
-                                  max_length=max_prompt_length,
-                                  return_tensors="pt",
-                                  return_attention_mask=True,
-                                  truncation=True,
-                                  )
+            encodings = tokenizer(
+                texts,
+                padding="max_length",
+                max_length=max_prompt_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+                truncation=True,
+            )
             input_ids = encodings.input_ids
             attention_mask = encodings.attention_mask
             tokenizer.truncation_side = prev_truncation_side
@@ -305,6 +310,7 @@ class LMActorCriticPolicy(BasePolicy, ActorCriticWarmStartMixin):
             generation_kwargs_ = gen_kwargs
 
         # generate
+        LOGGER.debug(f"[bold blue]policy.generate:[white] pre-generate")
         gen_output = unwrap_model(self._policy_model).generate(
             inputs=input_ids.to(
                 self.get_policy_first_device()),
@@ -313,6 +319,7 @@ class LMActorCriticPolicy(BasePolicy, ActorCriticWarmStartMixin):
             return_dict_in_generate=True,
             output_scores=True,
             **generation_kwargs_)
+        LOGGER.debug(f"[bold blue]policy.generate:[white] post-generate")
 
         # number of tokens generated
         seq_length = len(gen_output["scores"])
@@ -371,20 +378,6 @@ class Seq2SeqLMActorCriticPolicy(LMActorCriticPolicy):
 
         self._value_head = nn.Linear(
             self._value_model.config.hidden_size, 1, bias=False)
-
-        # apply model parallel
-        if torch.cuda.is_available():
-            if self._apply_model_parallel and self._policy_model.is_parallelizable:
-                self._policy_model.parallelize()
-                self._ref_model.parallelize()
-                self._value_model.parallelize()
-                self._value_head = self._value_head.to(self.device)
-            else: # else defaults to data parallel
-                self._policy_model = torch.nn.DataParallel(self._policy_model)
-                self._ref_model = torch.nn.DataParallel(self._ref_model)
-                self._value_model = torch.nn.DataParallel(self._value_model)
-                self._value_head = torch.nn.DataParallel(self._value_head.to(self.device))
-
 
     def forward_policy(self, obs: TensorDict,
                        actions: torch.tensor,
@@ -600,16 +593,6 @@ class MaskableLMActorCriticPolicy(BasePolicy, MaskableActorCriticWarmStartMixin)
 
         self._value_head = nn.Linear(
             self._value_model.config.hidden_size, 1, bias=False)
-
-        # apply model parallel
-        if torch.cuda.is_available() and self._apply_model_parallel:
-            if self._policy_model.is_parallelizable:
-                self._policy_model.parallelize()
-                self._ref_model.parallelize()
-                self._mask_model.parallelize()
-            if self._value_model.is_parallelizable:
-                self._value_model.parallelize()
-        self._value_head = self._value_head.to(self.device)
 
         self.logits_processor = MaskLogitsProcessorCasualLM(
             self._mask_model, self.action_space, self.top_mask, self._apply_model_parallel, self.get_policy_first_device, self.mask_type, self.min_tokens_to_keep)
@@ -938,21 +921,6 @@ class MaskableSeq2SeqLMActorCriticPolicy(MaskableLMActorCriticPolicy):
 
         self._value_head = nn.Linear(
             self._value_model.config.hidden_size, 1, bias=False)
-
-        # apply model parallel
-        if torch.cuda.is_available():
-            if self._apply_model_parallel and self._policy_model.is_parallelizable:
-                self._policy_model.parallelize()
-                self._ref_model.parallelize()
-                self._mask_model.parallelize()
-                self._value_model.parallelize()
-                self._value_head = self._value_head.to(self.device)
-            else: # else defaults to data parallel
-                self._policy_model = torch.nn.DataParallel(self._policy_model)
-                self._ref_model = torch.nn.DataParallel(self._ref_model)
-                self._mask_model = torch.nn.DataParallel(self._mask_model)
-                self._value_model = torch.nn.DataParallel(self._value_model)
-                self._value_head = torch.nn.DataParallel(self._value_head.to(self.device))
 
         self.logits_processor = MaskLogitsProcessorSeq2SeqLM(
             self._mask_model, self.action_space, self.top_mask, self._apply_model_parallel, self.get_policy_first_device, self.mask_type, self.min_tokens_to_keep)

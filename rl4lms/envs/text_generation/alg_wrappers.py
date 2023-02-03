@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple, Type
 
+import accelerate
 import numpy as np
 import torch
 from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
@@ -11,7 +12,7 @@ from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.vec_env import VecEnv
 from transformers import PreTrainedTokenizer
 
-from rl4lms.algorithms.common.maskable.buffers import MaskableDictRolloutBuffer
+from rl4lms.algorithms.common.maskable.buffers import MaskableDictRolloutDataloaderBuilder, MaskableDictRolloutBuffer, MaskableDictRolloutDataset
 from rl4lms.envs.text_generation.kl_controllers import KLController
 from rl4lms.envs.text_generation.logging_utils import Tracker
 from rl4lms.envs.text_generation.policy.base_policy import (
@@ -88,37 +89,51 @@ def compute_batched_rewards(
 
 
 def wrap_onpolicy_alg(
+    *,
     alg_class: Type[OnPolicyAlgorithm],
     alg_kwargs: Dict[str, Any],
     kl_coeff: float,
     tracker: Tracker,
     target_kl: float = None,
     norm_reward: bool = False,
+    accelerator: accelerate.Accelerator,
+    dataloader_kwargs: Dict[str, Any],
 ):
     class OnPolicyAlgText(alg_class, OnPolicyWarmStartMixin):
         def __init__(
             self,
+            *,
             alg_kwargs: Dict[str, Any],
             kl_coeff: float,
             tracker: Tracker,
             target_kl: float = None,
             norm_reward: bool = False,
+            accelerator: accelerate.Accelerator,
+            dataloader_kwargs: Dict[str, Any],
         ):
             alg_kwargs["tracker"] = tracker
             super().__init__(**alg_kwargs)
             self._kl_controller = KLController(kl_coeff, target_kl)
             self.tracker = tracker
             self._norm_reward = norm_reward
+            self._accelerator = accelerator
             # flattened rollout buffer
-            self.rollout_buffer = MaskableDictRolloutBuffer(
-                self.n_steps * self.env.num_envs,
-                self.observation_space,
-                self.action_space,
+            
+            dataset = MaskableDictRolloutDataset(
+                buffer_size=self.n_steps * self.env.num_envs,
+                observation_space=self.observation_space,
+                action_space=self.action_space,
                 device=self.device,
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
                 n_envs=1,
             )
+            self.rollout_buffer = MaskableDictRolloutDataloaderBuilder(
+                dataset=dataset,
+                accelerator=self._accelerator,
+                dataloader_kwargs=dataloader_kwargs,
+            )
+
             self.reward_fn = self.env.get_attr("reward_function", 0)[0]
 
         def get_policy_kwargs(
@@ -404,5 +419,13 @@ def wrap_onpolicy_alg(
             return True
 
     # instantiate the wrapped alg
-    alg = OnPolicyAlgText(alg_kwargs, kl_coeff, tracker, target_kl, norm_reward)
+    alg = OnPolicyAlgText(
+        alg_kwargs=alg_kwargs, 
+        kl_coeff=kl_coeff, 
+        tracker=tracker, 
+        target_kl=target_kl, 
+        norm_reward=norm_reward,
+        accelerator=accelerator,
+        dataloader_kwargs=dataloader_kwargs,
+    )
     return alg

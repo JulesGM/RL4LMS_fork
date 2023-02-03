@@ -1,6 +1,11 @@
+import logging
+import itertools
 from typing import Any, Dict, List
 
+
+import rich
 from stable_baselines3.common.policies import BasePolicy
+import torch.distributed as dist
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
@@ -10,8 +15,18 @@ from rl4lms.data_pools.custom_text_generation_pools import Sample
 from rl4lms.envs.text_generation.logging_utils import Tracker
 from rl4lms.envs.text_generation.metric import BaseMetric
 
+LOGGER = logging.getLogger(__name__)
+
+
+def gather_and_chain(obj_to_gather: Any, accelerator: Accelerator):
+    gathered = [None] * accelerator.num_processes
+    dist.all_gather_object(gathered, obj=obj_to_gather)
+    assert None not in gathered
+    return list(itertools.chain.from_iterable(gathered))
+
 
 def evaluate_on_samples(
+    *,
     policy: BasePolicy,
     tokenizer: AutoTokenizer,
     dataloader: DataLoader,
@@ -24,15 +39,30 @@ def evaluate_on_samples(
     dt_control_token: str = "",
     gen_kwargs: Dict[str, Any] = None,
 ):  
+    LOGGER.debug(
+        f"[bold blue]evaluation_utils.evaluate_on_samples: "
+        f"[white]entry, {split_name = }, {type(dataloader) = }"
+    )
+
+    assert isinstance(policy, BasePolicy), type(policy).mro()
+
     # generate text by batch
     all_generated_texts = []
     all_ref_texts = []
     all_prompt_texts = []
     all_meta_infos = []
+
     for batch in dataloader:
         batch_generated_texts = generate_text(
-            policy, tokenizer, batch, accelerator, max_prompt_length, dt_control_token, gen_kwargs
+            policy=policy,
+            tokenizer=tokenizer,
+            samples=batch,
+            accelerator=accelerator,
+            max_prompt_length=max_prompt_length,
+            dt_control_token=dt_control_token,
+            gen_kwargs=gen_kwargs,
         )
+
         batch_ref_texts = [sample.references for sample in batch]
         batch_prompt_texts = [sample.prompt_or_input_text for sample in batch]
         batch_meta_infos = [sample.meta_data for sample in batch]
@@ -41,6 +71,81 @@ def evaluate_on_samples(
         all_prompt_texts.extend(batch_prompt_texts)
         all_meta_infos.extend(batch_meta_infos)
 
+    LOGGER.debug(
+            f"[bold blue]evaluation_utils.evaluate_on_samples: "
+            f"[white]exit, {split_name = }"
+        )
+
+
+    all_generated_texts = gather_and_chain(all_generated_texts, accelerator)
+    all_prompt_texts = gather_and_chain(all_prompt_texts, accelerator)
+    all_meta_infos = gather_and_chain(all_meta_infos, accelerator)
+    all_ref_texts = gather_and_chain(all_ref_texts, accelerator)
+
+    if accelerator.is_main_process:
+        corpus_level_metrics = {}
+        sample_scores_by_metric = {}
+        if metrics is not None:
+            for metric in metrics:
+                metric_dict = metric.compute(
+                    all_prompt_texts,
+                    all_generated_texts,
+                    all_ref_texts,
+                    all_meta_infos,
+                    policy.get_language_model(),
+                    split_name,
+                )
+
+                for metric_key, (sample_scores, corpus_score) in metric_dict.items():
+                    if sample_scores is None:
+                        sample_scores = ["n/a"] * len(dataloader)
+                    corpus_level_metrics[metric_key] = corpus_score
+                    sample_scores_by_metric[metric_key] = sample_scores
+
+        # aggregate sample metric scores
+        sample_predictions_dict = []
+
+        assert (
+            len(dataloader.dataset ) == 
+            len(all_generated_texts) == 
+            len(all_prompt_texts   ) == 
+            len(all_ref_texts      )), (
+                f"\n"
+                f"{len(dataloader.dataset)  = }\n"
+                f"{len(all_generated_texts) = }\n"
+                f"{len(all_prompt_texts)    = }\n"
+                f"{len(all_ref_texts)       = }\n"
+            )
+
+        for ix, (sample, prompt_text, generated_text, ref_texts) in enumerate(
+            zip(dataloader.dataset, all_prompt_texts, all_generated_texts, all_ref_texts)
+        ):
+            sample_prediction = {
+                "split_name": split_name,
+                "sample_id": sample.id,
+                "prompt_text": prompt_text,
+                "generated_text": generated_text,
+                "ref_text": "".join(
+                    [
+                        f"<START-{ref_ix+1}>" + ref_text + f"<END-{ref_ix+1}>"
+                        for ref_ix, ref_text in enumerate(ref_texts)
+                    ]
+                ),
+            }
+            for metric_key, sample_scores in sample_scores_by_metric.items():
+                sample_prediction[metric_key] = sample_scores[ix]
+            sample_predictions_dict.append(sample_prediction)
+
+        if tracker is not None:
+            # log the entire predictions
+            tracker.log_predictions(epoch, split_name, sample_predictions_dict)
+            # log the corpus level scores
+            tracker.log_metrics(epoch, split_name, corpus_level_metrics)
+
+        LOGGER.debug(
+            f"[bold blue]evaluation_utils.evaluate_on_samples: "
+            f"[white]exit, {split_name = }"
+        )
 
 def generate_text(
     policy: BasePolicy,
@@ -51,14 +156,25 @@ def generate_text(
     dt_control_token: str,
     gen_kwargs: Dict[str, Any],
 ):
+    import rich
+    rich.print(f"{gen_kwargs                                   = }")
+    rich.print(f"{type(policy)                                 = }")
+    rich.print(f"{type(accelerator.unwrap_model(policy)).mro() = }")
+
     prompt_texts = [
         dt_control_token + sample.prompt_or_input_text for sample in samples
     ]
-    generated_texts = accelerator.unwrap_model(policy).generate(
-        tokenizer, accelerator, prompt_texts, max_prompt_length, gen_kwargs=gen_kwargs
-    ).gen_texts
-    return generated_texts
 
+    generated_texts = accelerator.unwrap_model(policy).generate(
+        tokenizer=tokenizer, 
+        accelerator=accelerator, 
+        texts=prompt_texts, 
+        max_prompt_length=max_prompt_length, 
+        gen_kwargs=gen_kwargs,
+    ).gen_texts
+
+    LOGGER.debug("[bold blue]evaluation_utils.generate_text: [white]exit")
+    return generated_texts
 
 
 # def evaluate_on_samples(
@@ -139,19 +255,3 @@ def generate_text(
 #         # log the corpus level scores
 #         tracker.log_metrics(epoch, split_name, corpus_level_metrics)
 
-
-# def generate_text(
-#     policy: BasePolicy,
-#     tokenizer: AutoTokenizer,
-#     samples: List[Sample],
-#     max_prompt_length: int,
-#     dt_control_token: str,
-#     gen_kwargs: Dict[str, Any],
-# ):
-#     prompt_texts = [
-#         dt_control_token + sample.prompt_or_input_text for sample in samples
-#     ]
-#     generated_texts = policy.generate(
-#         tokenizer, prompt_texts, max_prompt_length, gen_kwargs=gen_kwargs
-#     ).gen_texts
-#     return generated_texts

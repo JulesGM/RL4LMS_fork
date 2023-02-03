@@ -21,5 +21,10 @@ def collate_fn(batch: List[Sample]):
 
 def create_dataloader(samples: List[Sample], batch_size: int):
     dataset = TextGenDataset(samples)
-    dataloader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    dataloader = DataLoader(
+        dataset=dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        collate_fn=collate_fn,
+    )
     return dataloader
