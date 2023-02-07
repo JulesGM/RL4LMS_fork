@@ -418,6 +418,7 @@ class MaskableDictRolloutDataloaderBuilder:
         We send the new data to each process.            
 
         """
+        args = list(args)
         if self._accelerator:
             for i, v in enumerate(args):
                 if isinstance(v, torch.Tensor):
