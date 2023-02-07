@@ -431,7 +431,7 @@ class MaskableDictRolloutDataloaderBuilder:
                         v.to(self._accelerator.device)
                     )
 
-        self._dataset.add(*args, **kwargs)
+        self._dataset._rollout_buffer.add(*args, **kwargs)
 
     def get(self, batch_size):
         """Returns a generator that yields batches.
