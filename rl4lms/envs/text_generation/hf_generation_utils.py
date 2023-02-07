@@ -1730,8 +1730,12 @@ class GenerationMixinWithRawScores:
                     )
 
             # pre-process distribution
+            print(f"{logits_processor             = }")
+            print(f"{type(logits_processor).mro() = }")
+            
             next_tokens_scores = logits_processor(
-                input_ids, next_token_logits, model_inputs)
+                input_ids, next_token_logits, model_inputs
+            )
 
             # argmax
             next_tokens = torch.argmax(next_tokens_scores, dim=-1)

@@ -44,8 +44,6 @@ def evaluate_on_samples(
         f"[white]entry, {split_name = }, {type(dataloader) = }"
     )
 
-    assert isinstance(policy, BasePolicy), type(policy).mro()
-
     # generate text by batch
     all_generated_texts = []
     all_ref_texts = []
@@ -156,11 +154,6 @@ def generate_text(
     dt_control_token: str,
     gen_kwargs: Dict[str, Any],
 ):
-    import rich
-    rich.print(f"{gen_kwargs                                   = }")
-    rich.print(f"{type(policy)                                 = }")
-    rich.print(f"{type(accelerator.unwrap_model(policy)).mro() = }")
-
     prompt_texts = [
         dt_control_token + sample.prompt_or_input_text for sample in samples
     ]
@@ -173,7 +166,6 @@ def generate_text(
         gen_kwargs=gen_kwargs,
     ).gen_texts
 
-    LOGGER.debug("[bold blue]evaluation_utils.generate_text: [white]exit")
     return generated_texts
 
 

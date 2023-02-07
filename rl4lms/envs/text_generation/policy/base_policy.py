@@ -201,6 +201,7 @@ class LMActorCriticPolicy(BasePolicy):
             and texts is not None
             and max_prompt_length is not None
         ):
+            
             # override truncation side for prompt
             prev_truncation_side = tokenizer.truncation_side
             tokenizer.truncation_side = self._prompt_truncation_side

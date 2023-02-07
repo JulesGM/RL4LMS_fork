@@ -334,7 +334,8 @@ class Seq2SeqLMActorCriticPolicy(LMActorCriticPolicy, ActorCriticWarmStartMixin)
     def get_inputs_for_generation(self, obs: TensorDict) -> GenerationInputs:
 
         generation_inputs = GenerationInputs(
-            obs["prompt_or_input_encoded_pt"], obs["prompt_or_input_attention_mask_pt"]
+            obs["prompt_or_input_encoded_pt"].long(), 
+            obs["prompt_or_input_attention_mask_pt"].long(),
         )
         return generation_inputs
 

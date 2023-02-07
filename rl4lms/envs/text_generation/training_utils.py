@@ -3,6 +3,8 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import rich
+
 from rl4lms.data_pools.text_generation_pool import Sample
 from rl4lms.envs.text_generation.env import TextGenEnv
 from rl4lms.envs.text_generation.evaluation_utils import evaluate_on_samples
@@ -43,9 +45,14 @@ from rl4lms.envs.text_generation.utils_supervised import (
 )
 from rl4lms.envs.text_generation.warm_start import TrainerWarmStartMixin
 
+import general_utils as gu
+
+
 LOGGER = logging.getLogger(__name__)
 DEEPSPEED_KEY = "supervised_deepspeed"
 OUTPUT_DIR_KEY = "supervised_output_dir"
+
+
 
 def build_tokenizer(tokenizer_config: Dict[str, Any]):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_config["model_name"])
@@ -202,29 +209,24 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
         # gen kwargs for evaluation (if it is different from rollout gen kwargs)
         self._eval_gen_kwargs = self._train_eval_config.get("generation_kwargs", None)
 
-
-        self._accelerator = Accelerator()
+        self._main_accelerator = Accelerator()
+        self._reward_accelerator = Accelerator()
 
         # prepare for accelerate
         self._alg = build_alg(
-            accelerator=self._accelerator,
+            accelerator=self._main_accelerator,
             alg_config=self._on_policy_alg_config,
             env=self._env,
             tracker=self._tracker,
             policy_state=self._policy_state_dict,
             alg_state=self._alg_state_dict,
         )
+
         self._n_steps_per_iter = self._env.num_envs * self._alg.n_steps
-
-        assert isinstance(self._alg.policy, BasePolicy), type(self._alg.policy).mro()
         self._prepare_accelerate()
-        assert isinstance(self._alg.policy, BasePolicy), type(self._alg.policy).mro()
-
         
 
     def _prepare_accelerate(self):
-
-        assert isinstance(self._alg.policy, BasePolicy), type(self._alg.policy).mro()
         # create optimizer first
         optimizer = self._alg.policy.setup_optimizer()
 
@@ -233,9 +235,6 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
             "val": create_dataloader(self._samples_by_split["val"], self._eval_batch_size),
             "test": create_dataloader(self._samples_by_split["test"], self._eval_batch_size),
         }
-        assert isinstance(self._accelerator.unwrap_model(self._alg.policy), BasePolicy), (
-            type(self._alg.policy).mro()
-        )
 
         # prepare policy, optimizer and dataloader
         (
@@ -243,28 +242,23 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
             self._alg.optimizer,
             self._dataloaders["val"],
             self._dataloaders["test"],
-            *accelerated_models,
-        ) = self._accelerator.prepare(self._alg.policy,
-                                      optimizer, 
-                                      self._dataloaders["val"], 
-                                      self._dataloaders["test"],
-                                      *self._reward_fn._models.values())
-
-        assert isinstance(self._accelerator.unwrap_model(self._alg.policy), BasePolicy), (
-            type(self._alg.policy).mro()
+        ) = self._main_accelerator.prepare(
+            self._alg.policy,
+            optimizer, 
+            self._dataloaders["val"], 
+            self._dataloaders["test"],
         )
 
-        # Dicts are orderd, this is fine
-        for key, accelerated in zip(self._reward_fn._models, accelerated_models):
-            self._reward_fn._models[key] = accelerated
-
+        self._reward_fn, _ = self._reward_accelerator.prepare(
+            self._reward_fn,
+            self._dataloaders["val"], 
+        )
+        
 
 
     def _evaluate_on_datapools(self, epoch: int, splits: List[str] = ["val", "test"]):
         
         LOGGER.debug(f"[blue bold]OnPolicyTrainer._evaluate_on_datapools: [white]Entry - {splits}")
-
-        assert isinstance(self._alg.policy, BasePolicy), type(self._alg.policy).mro()
 
         for split in splits:
             evaluate_on_samples(
@@ -275,7 +269,7 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
                 metrics=self._metrics,
                 epoch=epoch,
                 split_name=split,
-                accelerator=self._accelerator,
+                accelerator=self._main_accelerator,
                 tracker=self._tracker,
                 gen_kwargs=self._eval_gen_kwargs,
             )
@@ -287,8 +281,6 @@ class OnPolicyTrainer(TrainerWarmStartMixin):
         # evaluate on val and test set before fine-tuning once
         iter_start = self._trainer_state["current_iter"]
         self._evaluate_on_datapools(epoch=iter_start)
-
-        assert False
 
         # train for given number of iters
         for epoch in range(iter_start, self._n_iters):

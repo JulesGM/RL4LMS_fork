@@ -168,13 +168,14 @@ def wrap_onpolicy_alg(
             current_obs = self.env.reset()
             episode_starts = np.ones((self.env.num_envs,), dtype=bool)
 
-            # generate text using the model
             obs_tensor = obs_as_tensor(current_obs, self.device)
             generation_inputs = self.policy.get_inputs_for_generation(obs_tensor)
+
             gen_output = self.policy.generate(
-                input_ids=generation_inputs.inputs,
-                attention_mask=generation_inputs.attention_masks,
+                input_ids=generation_inputs.inputs.long(),
+                attention_mask=generation_inputs.attention_masks.long(),
                 tokenizer=tokenizer,
+                accelerator=self._accelerator,
             )
 
             # process them one step at a time to collect rollout info
