@@ -421,10 +421,14 @@ class MaskableDictRolloutDataloaderBuilder:
         if self._accelerator:
             for i, v in enumerate(args):
                 if isinstance(v, torch.Tensor):
-                    args[i] = self._accelerator.gather(v)
+                    args[i] = self._accelerator.gather(
+                        v.to(self._accelerator.device)
+                    )
             for k, v in kwargs.items():
                 if isinstance(v, torch.Tensor):
-                    kwargs[k] = self._accelerator.gather(v)
+                    kwargs[k] = self._accelerator.gather(
+                        v.to(self._accelerator.device)
+                    )
 
         self._dataset.add(*args, **kwargs)
 
