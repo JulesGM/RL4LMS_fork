@@ -447,7 +447,6 @@ class MaskableDictRolloutDataloaderBuilder:
         )
 
         if self._accelerator:
-            assert False
             yield from self._accelerator.prepare_data_loader(dataloader)
         else:
             yield from dataloader
